@@ -1,14 +1,14 @@
 [Unit]
-Description=IPv4 firewall country blocker with iptables
-After=iptables.service
+Description=IPv4 country blocker for firewalld & iptables
+After=iptables.service firewalld.service
 Requires=iptables.service
-ConditionPathExists=/etc/sysconfig/iptables.cb
+ConditionPathExists=/etc/sysconfig/xenodrop
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/libexec/iptables/iptables-cb.init start
-ExecStop=/usr/libexec/iptables/iptables-cb.init stop
+ExecStart=/usr/libexec/xenodrop/xenodrop.sh start
+ExecStop=/usr/libexec/xenodrop/xenodrop.sh stop
 Environment=BOOTUP=serial
 Environment=CONSOLETYPE=serial
 StandardOutput=syslog

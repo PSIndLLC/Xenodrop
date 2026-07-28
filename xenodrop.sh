@@ -1,13 +1,15 @@
 #!/bin/bash
 #
-# iptables-country-block  Add country blocking rules to iptables firewall
+# Xenodrop  Add country blocking rules to iptables firewall or firewalld drop
+# zone
 #
 # chkconfig: 2345 09 91
-# description:	Adds and removes country blocking rules to iptables firewall
+# description:	Maintains country blocking rules in iptables firewall & firewalld
+# drop zone
 #
-# config: /etc/sysconfig/iptables-cb-config
+# config: /etc/sysconfig/xenodrop
 #
-# See http://blog.psind.com/solutions/products/iptables-cb/ for detailed
+# See http://blog.psind.com/solutions/products/xenodrop/ for detailed
 # information
 #
 # Origin from http://www.cyberciti.biz/faq/block-entier-country-using-iptables
@@ -15,10 +17,11 @@
 # include ability to cache the address list, create chains by subnet thus 
 # optimizing rule execution, clean up the rules without wiping the existing 
 # tables, include port overrides to allow traffic deemed 'safe', and leverage 
-# iptables-restore to optimize rules loading.
+# iptables-restore to optimize rules loading. Introduce firewalld management
 
 # Source function library.
-. /etc/init.d/functions
+[ -f /etc/init.d/functions ] && . /etc/init.d/functions
+[ -f /lib/lsb/init-functions ] && . /lib/lsb/init-functions
 
 # The following values may be overridden in the config
 ### Block all traffic from AFGHANISTAN (af), CHINA (CN) and KOREA(kr).
@@ -32,51 +35,67 @@ DLSOURCE="ipdeny"
 IPDENYZONETYPE="aggregated"
 IPDENYDLROOT="http://www.ipdeny.com/ipblocks/data/${IPDENYZONETYPE}"
 GEOLITEDLROOT="http://geolite.maxmind.com/download/geoip/database"
-IPSETCBRESTORE="/etc/sysconfig/ipsets.cb"
-IPTCBRESTORE="/etc/sysconfig/iptables.cb"
-IPTCBSETRESTORE="/etc/sysconfig/iptables.set.cb"
-IPTCBDEVICE=eth0
+
+IPTSYSCONFDIR="/etc/iptables"
+[ ! -d ${IPTSYSCONFDIR} ] && IPTSYSCONFDIR="/etc/sysconfig"
+XENODROPIPSETS="${IPTSYSCONFDIR}/ipsets.xenodrop"
+XENODROPIPTBLS="${IPTSYSCONFDIR}/iptables.xenodrop"
+XENODROPDEV=`ip route show | grep default | cut -f 5 -d ' '`
 ALLOWPORTS=80,443
 ALLOWSUBNET=192.168.0.0/255.255.0.0
 MAXZONEAGE=30
-IPTABLES_VERBOSE="no"
-IPTABLES_STATUS_NUMERIC="yes"
-IPTABLES_STATUS_VERBOSE="yes"
-IPTABLES_STATUS_LINENUMBERS="yes"
+XENODROP_VERBOSE="no"
+XENODROP_STATUS_NUMERIC="yes"
+XENODROP_STATUS_VERBOSE="yes"
+XENODROP_STATUS_LINENUMBERS="yes"
+#XENODROP_LOGUNIT=xenodrop
 
 ### Set PATH ###
 IPT=/sbin/iptables
 WGET=/usr/bin/wget
-EGREP=/bin/egrep
+GREP=/bin/grep\ -E
 IPSET=`whereis -b ipset | cut -f 2 -d ' '`
-IPTABLES_CB_CONFIG=/etc/sysconfig/iptables-cb-config
+XENODROP_CONFIG=${IPTSYSCONFDIR}/xenodrop
  
 ### No editing below ###
-IPTABLESCB=`basename $0`
+PROGNAME=`basename $0`
 CBLIST="countrydrop"
-IPTCBLOG=/var/log/iptables_cb.log
-IPSETCBLOAD=`mktemp`
-IPTCBLOAD=`mktemp`
-IPTCBTMP=`mktemp`
-ZONEROOT="/var/iptables"
+XENODROPLOG=/var/log/xenodrop.log
+TMPIPSETS=`mktemp`
+TMPIPTBLS=`mktemp`
+TMPIPTRULES=`mktemp`
+XENOROOT="/var/xenodrop"
 # Identify directory to hold cache of country files for CIDRs
-CNZONECACHE="/var/cache/country_ips"
+XENOCACHE="/var/cache/xenodrop"
  
 # Load country blocking firewall configuration.
-[ -f "$IPTABLES_CB_CONFIG" ] && . "$IPTABLES_CB_CONFIG"
+[ -f "$XENODROP_CONFIG" ] && . "$XENODROP_CONFIG"
 
 # Ensure existance of zone cache directory
-[ ! -d "${CNZONECACHE}" ] && mkdir -p "${CNZONECACHE}"
+[ ! -d "${XENOCACHE}" ] && mkdir -p "${XENOCACHE}"
+
+
+cleanFirewalldGeoDrops(){
+    # Remove unconfigured geo ipsets from "drop" zone
+    _zsrcs=`firewall-cmd --permanent --zone=drop --list-sources`
+    for s in $_zsrcs ; do
+	printf "Remove %s from drop zone and delete ipset\n" "${s}"
+	firewall-cmd -q --zone=drop --remove-source=${s}
+	firewall-cmd -q --permanent --zone=drop --remove-source=${s}
+	firewall-cmd -q --permanent --delete-ipset=${s}
+    done
+    firewall-cmd --reload
+}
 
 cleanOldRules(){
     $IPT -L $CBLIST > /dev/null 2>&1
     if [ $? = 0 ] ; then
-	$IPT -D INPUT ${IPTCBDEVICE:+-i }${IPTCBDEVICE} -j $CBLIST
-	$IPT -D FORWARD ${IPTCBDEVICE:+-i }${IPTCBDEVICE} -j $CBLIST
-	$IPT -D OUTPUT ${IPTCBDEVICE:+-o }${IPTCBDEVICE} -j $CBLIST
+	$IPT -D INPUT ${XENODROPDEV:+-i }${XENODROPDEV} -j $CBLIST
+	$IPT -D FORWARD ${XENODROPDEV:+-i }${XENODROPDEV} -j $CBLIST
+	$IPT -D OUTPUT ${XENODROPDEV:+-o }${XENODROPDEV} -j $CBLIST
+	$IPT -F $CBLIST
+	$IPT -X $CBLIST
     fi
-    $IPT -F $CBLIST
-    $IPT -X $CBLIST
 
     for i  in `$IPT -L -n | grep Chain | cut -f 2 -d ' ' | grep "\-$CBLIST"`
     do
@@ -84,55 +103,64 @@ cleanOldRules(){
 	$IPT -X ${i}
     done
 
-    if [ ! "Z${IPSET}" = "Z" ] ; then
-    for t in `$IPSET list -terse | grep Name | cut -f 2 -d ' ' | grep _cbnet`
-    do
-        $IPSET flush ${t}
-        $IPSET destroy ${t}
-    done
+    if [ -z "${IPSET}" ] ; then
+	for t in `$IPSET list -terse | grep Name | cut -f 2 -d ' ' | grep _cbnet`
+	do
+            $IPSET flush ${t}
+            $IPSET destroy ${t}
+	done
+    fi
+
+    if [ -d /etc/firewalld/ipsets ] ; then
+	cleanFirewalldGeoDrops
     fi
 }
 
 downloadIPDenyZoneData() {
-    pushd ${CNZONECACHE} 
-    for c in $ISO
-    do
-        printf "Downloading %s IPDeny data from %s\n" ${c} ${IPDENYDLROOT}
- 
-	if [  "${IPDENYZONETYPE}" = "aggregated" ] ; then
-	    $WGET -O $ZONEROOT/$c.zone $IPDENYDLROOT/${c}-aggregated.zone
+    # IPDeny zone files are simple lists of CIDR records requiring no transformation
+    pushd ${XENOCACHE} 
+    for c in $ISO ; do
+	ZONEFILE=${c}.zone
+	if [ ! -f ${ZONEFILE} ] ; then
+            printf "Downloading %s IPDeny data from %s\n" ${c} ${IPDENYDLROOT}
+ 	    if [  "${IPDENYZONETYPE}" = "aggregated" ] ; then
+		$WGET -O $XENOCACHE/$c.zone $IPDENYDLROOT/${c}-aggregated.zone
+	    else
+		$WGET -O $XENOCACHE/$c.zone $IPDENYDLROOT/$c.zone
+	    fi
 	else
-	    $WGET -O $ZONEROOT/$c.zone $IPDENYDLROOT/$c.zone
+            printf "Using cached zone data for %s from %s\n" ${c} ${XENOCACHE}/${ZONEFILE}
 	fi
     done
     popd
 }
 
 downloadGeoliteZoneData() {
-    TDT=`date "+%Y%m%d"`
-    BKDIR=${ZONEROOT}/arch/${TDT}
-
-    pushd ${CNZONECACHE} 
-
-    DL_DATAFILE=GeoLite2-Country-CSV.zip
+    # Geolite zone data is represented in CSV files and must be translated into CIDR lists
     WGET=/usr/bin/wget
-
-    DATADL_DIR=${ZONEROOT}/dl
+    TDT=`date "+%Y%m%d"`
+    DL_DATAFILE=GeoLite2-Country-CSV.zip
+    # DATADL_DIR is path to hold raw download data pending transformation
+    DATADL_DIR=${XENOCACHE}/dl
+    BKDIR=${XENOROOT}/arch/${TDT}
     [ ! -d ${DATADL_DIR} ] && mkdir -p ${DATADL_DIR}
-
-    # Backup data file to backup dir if not yet moved - no overwrite
-    [ ! -f ${BKDIR}/${DL_DATAFILE} ] && [ -f ${DATADL_DIR}/${DL_DATAFILE} ] && mv ${DATADL_DIR}/${DL_DATAFILE} ${BKDIR}/${DL_DATAFILE}
 
     # Download data if source file is not present
     pushd ${DATADL_DIR}
-    rm -f ${DL_DATAFILE}
-
+    # Backup data file to backup dir if not yet moved - no overwrite
+    if  [ -f ${DL_DATAFILE} ] ; then
+	if [ ! -f ${BKDIR}/${DL_DATAFILE} ] ; then
+	    mv ${DL_DATAFILE} ${BKDIR}/
+	else rm -f ${DL_DATAFILE} ; fi
+    fi
     printf "Downloading IP data from: %s\n" ${GEOLITEDLROOT}/${DL_DATAFILE}
-     $WGET ${GEOLITEDLROOT}/${DL_DATAFILE}
+    $WGET ${GEOLITEDLROOT}/${DL_DATAFILE}
     popd
-    rm -f ${DL_DATAFILE} GeoLite2-Country-Locations.csv GeoLite2-Country-Blocks.csv
-    cp ${DATADL_DIR}/${DL_DATAFILE} .
-    unzip -ju ${DL_DATAFILE} */GeoLite2-Country-Locations.csv */GeoLite2-Country-Blocks.csv
+
+    pushd ${XENOCACHE} 
+
+    rm -f GeoLite2-Country-Locations.csv GeoLite2-Country-Blocks.csv
+    unzip -ju ${DATADL_DIR}/${DL_DATAFILE} */GeoLite2-Country-Locations.csv */GeoLite2-Country-Blocks.csv
 
     export IFS="," 
 
@@ -141,7 +169,7 @@ downloadGeoliteZoneData() {
     while read GEO_IP IP_MASK_LEN IP_RG_CD IP_CN_CD IP_LINE ; do
 	declare -i CIDR=$((32-(128-${IP_MASK_LEN})))
 	if [ ${CIDR} -lt 0 ] ; then
-	    printf "IPv6 support not provided: %s/%s\n" ${GEO_IP} ${IP_MASK_LEN}
+	    printf "IPv6 support not provided: %s/%s\n" ${GEO_IP} ${IP_MASK_LEN} >&2
 	else
             printf "%s/%s\n" ${GEO_IP} ${CIDR} | sed -e 's/::ffff://g' >> ${IP_CN_CD}.geo.zone
 	fi
@@ -158,7 +186,7 @@ downloadGeoliteZoneData() {
 		cat ${GEO_ID}.geo.zone >> ${CN_CD}.zone
 		rm ${GEO_ID}.geo.zone
             else
-		printf "Could not identify IP ranges for country %s : %s\n" "${CN_NAME}" "${CN_CD}"
+		printf "Could not identify IP ranges for country %s : %s\n" "${CN_NAME}" "${CN_CD}" >&2
 		rm ${CN_CD}.zone
             fi
 	fi
@@ -167,7 +195,7 @@ downloadGeoliteZoneData() {
 
     printf "Removing unmatched geo zone files:\n"
     ugz_count=`find . -maxdepth 1 -mindepth 1 -name \*.geo.zone -print | wc -l`
-    [ $ugz_count -gt 0 ] &&     rm -f *.geo.zone
+    [ $ugz_count -gt 0 ] && rm -f *.geo.zone
 
     popd
 }
@@ -182,196 +210,200 @@ downloadZoneData() {
 
 updateZoneFiles() {
     TDT=`date "+%Y%m%d"`
-    ZONEARCH=${ZONEROOT}/arch/${TDT}
-    mkdir -p ${ZONEARCH}
-    # get fresh zone file if it is newer than MAXZONEAGE days
-    od_count=`find ${ZONEROOT} -maxdepth 1 -mindepth 1 -name \*.zone -type f -ctime +${MAXZONEAGE} -print | wc -l`
-    z_count=`find ${ZONEROOT} -maxdepth 1 -mindepth 1 -name \*.zone -type f -pr\
-int | wc -l`
-    b_count=`echo $ISO | wc -l`
-    ( [ $od_count -gt 0 ] || [ $z_count -lt $b_count ] ) && downloadZoneData
+    XENOARCH=${XENOROOT}/arch/${TDT}
+    mkdir -p ${XENOARCH}
 
-    # Remove outdated zone files
-    printf "Moving outdated zone files from %s to %s\n" ${ZONEROOT} ${ZONEARCH}
-    find ${ZONEROOT} -maxdepth 1 -mindepth 1 -name \*.zone -type f -ctime +${MAXZONEAGE} -exec mv {} ${ZONEARCH} \;
+    # Remove stale cached downloaded zone files
+    find ${XENOCACHE} -maxdepth 1 -mindepth 1 -name \*.zone -type f -ctime +${MAXZONEAGE} -exec rm -f {} \;
+    # Archive stale zone files in XENOROOT directory
+    printf "Moving outdated zone files from %s to %s\n" ${XENOROOT} ${XENOARCH}
+    find ${XENOROOT} -maxdepth 1 -mindepth 1 -name \*.zone -type f -ctime +${MAXZONEAGE} -exec mv {} ${XENOARCH} \;
+
+    # Download missing zones to cache
+    downloadZoneData
+
+    # Add s "custom" country code to hold customizations
+    ISO=${ISO}\ custom
+
+    # Archive zones removed from block list 
+    oldzones=`find ${XENOROOT} -mindepth 1 -maxdepth 1 -name \*.zone -type f -exec basename {} \; | cut -f 1 -d '.'`
+    for z in $oldzones ; do
+	if [[ ! "$ISO" =~ ${z} ]] ; then
+	    printf "Archiving unblocked zone: %s\n" ${z}
+	    mv ${XENOROOT}/${z}.zone ${XENOARCH}
+	fi
+    done
 
     od_count=0
-    ISO=${ISO}\ custom
-    for c in $ISO
-    do
-	# local zone file
-	tDB=$ZONEROOT/$c.zone
-	
-	if [ -f $tDB ] ; then
-	    printf "Zone file %s is new enough - no update required.\n" $tDB >>${IPTCBLOG}
-	else
-            # Copy from local cache of CIDR files by country
-            cp ${CNZONECACHE}/$c.zone $tDB
-	fi
-	[ $tDB -nt ${IPTCBRESTORE} ] && od_count=$(($od_count + 1))
-    done
-    oldzones=`find ${ZONEROOT} -mindepth 1 -maxdepth 1 -name \*.zone -type f -exec basename {} \; | cut -f 1 -d '.'`
-    # Archive old zones no longer blocked
-    printf "Archiving unblocked zones: %s\n" ${oldzones} 
-    for z in $oldzones ; do
-	archme=${c}
-	for c  in $ISO ; do
-	    if [ $c = $z ] ; then archme="X"; fi
-	done
-	if [ $archme = $z ] ; then
-	    mv ${archme} ${ZONEARCH}
-	else
-	    printf "Working from previous zone file for %s\n" ${z} >>${IPTCBLOG}
+    for c in $ISO ; do
+	cf=${XENOCACHE}/${c}.zone
+	zf=${XENOROOT}/${c}.zone
+	if [[ -f "${cf}" ]] ; then
+	    if [[ ! -f "${zf}" || "${cf}" -nt "${zf}" ]] ; then
+		# Copy from local cache of CIDR files by country if present
+		printf "Updating zone file %s from download cache\n" "${zf}"
+		cp "${cf}" "${zf}" && od_count=$(($od_count + 1))
+	    fi
 	fi
     done
 
     # Determine if CB Load file is outdated
-    CBL_REGEN = 0
-    if [ "z$IPSET" = "z" ] ; then
-	CBL_REGEN = `find $IPTCBRESTORE -maxdepth 0 -mindepth 0 -type f -ctime +$MAXZONEAGE -print | wc -l`
+    CBL_REGEN=0
+    if [[ -z "$IPSET" ]] ; then
+	CBL_REGEN=`find $XENODROPIPTBLS -maxdepth 0 -mindepth 0 -type f -ctime +$MAXZONEAGE -print | wc -l`
     else
-	CBL_REGEN = `find $IPSETCBRESTORE -maxdepth 0 -mindepth 0 -type f -ctime +$MAXZONEAGE -print | wc -l`
+	CBL_REGEN=`find $XENODROPIPSETS -maxdepth 0 -mindepth 0 -type f -ctime +$MAXZONEAGE -print | wc -l`
     fi
-    # If any zones were archived or restore file are aged - regenerate the CB iptable file
-    ( [ $od_count -gt 0 ] || [ $CBL_REGEN -lt 1 ] ) && generateIPTLoadFile
+    
+    # Return count of archived or regenerated zones
+    return $((od_count + CBL_REGEN))
 }
 
 reuseIPTLoadFile() {
-    cp -a ${IPSETTCBRESTORE} ${IPSETCBLOAD}
-    cp -a ${IPTCBRESTORE} ${IPTCBLOAD}
-    printf "Skipping country block file generation - using old file"  >>${IPTCBLOG}
+    cp -a ${XENODROPIPSETS} ${TMPIPSETS}
+    cp -a ${XENODROPIPTBLS} ${TMPIPTBLS}
+    printf "Skipping country block file generation - using old file\n" >&2
 }
 
 addCountryIPRanges() {
     c=${1}
 
     # local zone file
-    tDB=$ZONEROOT/$c.zone
+    tDB=$XENOROOT/$c.zone
 	
     # country specific log message
     SPAMDROPMSG="iptables: ${c}-Country-Drop: "
 	
     # Create drop chain for identified packets
     CBLISTDROP=${c}-${CBLIST}-DROP
-    printf ":${CBLISTDROP} - [0:0]\n" >> ${IPTCBLOAD}
-    printf "%s ${CBLISTDROP} -j LOG --log-prefix \"$SPAMDROPMSG\"\n" "-A" >> ${IPTCBTMP}
-    printf "%s ${CBLISTDROP} -j DROP\n" "-A" >> ${IPTCBTMP}
+    printf ":${CBLISTDROP} - [0:0]\n" >> ${TMPIPTBLS}
+    printf "%s ${CBLISTDROP} -j LOG --log-prefix \"$SPAMDROPMSG\"\n" "-A" >> ${TMPIPTRULES}
+    printf "%s ${CBLISTDROP} -j DROP\n" "-A" >> ${TMPIPTRULES}
     
-    # Load IP ranges into chains correlating to first octet
-    BADIPS=$(egrep -v "^#|^$" $tDB)
-    for ipblock in $BADIPS
-    do
+    # Load IP ranges from zone file into chains correlating to first octet
+    while IFS= read -r line || [[ -n "$line" ]]; do
+	# Remove everything after the first #
+	ipbloack="${line%%#*}"
+	
+	# Trim whitespace and skip if the result is empty or begins with a $
+	ipblock=$(echo "$ipblock" | xargs)
+	[[ -z "$ipblock" ]] && continue
+	
         topip=`echo $ipblock | cut -f 1 -d '.'`
-        chainExists=`grep -c :${topip}-${CBLIST} ${IPTCBLOAD}`
+        chainExists=`grep -c :${topip}-${CBLIST} ${TMPIPTBLS}`
         if [ $chainExists = 0 ] ; then
-            printf "Creating chain for octet %s\n" ${topip} >>${IPTCBLOG}
-	    printf ":$topip-$CBLIST - [0:0]\n" >> ${IPTCBLOAD}
+            printf "Creating chain for octet %s\n" ${topip} >&5
+	    printf ":$topip-$CBLIST - [0:0]\n" >> ${TMPIPTBLS}
 	    sip=${topip}.0.0.0/8
-	    printf "%s $CBLIST -s ${sip} -j $topip-$CBLIST\n" "-A" >> ${IPTCBTMP}
+	    printf "%s $CBLIST -s ${sip} -j $topip-$CBLIST\n" "-A" >> ${TMPIPTRULES}
 	fi
-	printf "  Adding rule for %s to chain for octet %s\n" ${ipblock} ${topip} >>${IPTCBLOG}
-	printf "%s $topip-$CBLIST -s $ipblock -j ${CBLISTDROP}\n" "-A" >> ${IPTCBTMP}
-    done
+	printf "  Adding rule for %s to chain for octet %s\n" ${ipblock} ${topip} >&5
+	printf "%s $topip-$CBLIST -s $ipblock -j ${CBLISTDROP}\n" "-A" >> ${TMPIPTRULES}
+    done < "$tDB"
 }
- 
-addCountryIPSet() {
+
+genCountryIPSet() {
     c=${1}
-    savesets=
+    _ipset_file=${2}
+    countryset=geo_${c}
 
     # local zone file
-    tDB=$ZONEROOT/$c.zone
+    tDB=$XENOROOT/$c.zone
+    [ ! -f ${tDB} ] && printf "Skipping drop on country %s - zone file %s not found\n" ${c} ${tDB} >&2 && return
+
+    _ipset_dt=`stat -c '%y' ${_ipset_file}`
+    [ $tDB -nt $_ipset_file ] && _ipset_dt=`stat -c '%y' $tDB`
+    netCount=`wc -l ${tDB} | cut -f 1 -d ' '`
+    
+    # Create ipset for country network segments
+    hashTblCnt=$((${netCount}*13/10))
+    printf "create %s hash:net family inet hashsize %s maxelem 65536\n" ${countryset} ${hashTblCnt} >> ${_ipset_file}
+    
+    # Load IP ranges from zone file into chains correlating to first octet
+    while IFS= read -r line || [[ -n "$line" ]]; do
+	# Remove everything after the first #
+	ipblock="${line%%#*}"
 	
+	# Trim whitespace and skip if the result is empty or begins with a $
+	ipblock=$(echo "$ipblock" | xargs)
+	[[ -z "$ipblock" ]] && continue
+	
+	printf "  Adding net %s to ipset %s\n" ${ipblock} ${countryset} >&5
+        printf "add %s %s\n" ${countryset} ${ipblock} >> ${_ipset_file}
+    done < "$tDB"
+    touch --date="${_ipset_dt}" ${_ipset_file}
+    printf "%s" "${countryset}"
+}
+
+addCountryIPSet() {
+    c=${1}
+    _cset=`genCountryIPSet ${c} ${TMPIPSETS}`
+
     # country specific log message
     SPAMDROPMSG="iptables: ${c}-Country-Drop: "
-	
+    
     # Create drop chain for identified packets
     CBLISTDROP=${c}-${CBLIST}-DROP
-    printf ":${CBLISTDROP} - [0:0]\n" >> ${IPTCBLOAD}
-    printf "%s ${CBLISTDROP} -j LOG --log-prefix \"$SPAMDROPMSG\"\n" "-A" >> ${IPTCBTMP}
-    printf "%s ${CBLISTDROP} -j DROP\n" "-A" >> ${IPTCBTMP}
-    
-    # Load IP ranges into chains correlating to first octet
-    BADIPS=$(egrep -v "^#|^$" $tDB)
-    for ipblock in $BADIPS
-    do
-        # Chain on top IP to reduce ipset sizes - set comparison performance 
-        #  degrades linearly as set size increases... this improves by 90+%
-        topip=`echo $ipblock | cut -f 1 -d '.'`
-        cntopipset=${c}_${topip}_cbnet
+    printf ":${CBLISTDROP} - [0:0]\n" >> ${TMPIPTBLS}
+    printf "%s ${CBLISTDROP} -j LOG --log-prefix \"$SPAMDROPMSG\"\n" "-A" >> ${TMPIPTRULES}
+    printf "%s ${CBLISTDROP} -j DROP\n" "-A" >> ${TMPIPTRULES}
 
-        chainExists=`grep -c :${topip}-${CBLIST} ${IPTCBLOAD}`
-        if [ $chainExists = 0 ] ; then
-            printf "Creating chain for octet %s\n" ${topip} >>${IPTCBLOG}
-	    printf ":$topip-$CBLIST - [0:0]\n" >> ${IPTCBLOAD}
-	    sip=${topip}.0.0.0/8
-	    printf "%s $CBLIST -s ${sip} -j $topip-$CBLIST\n" "-A" >> ${IPTCBTMP}
-	fi
-
-        # Test existence of ipset...
-        SET_COUNT=`grep -c ${cntopipset} ${IPSETCBLOAD}`
-        if [ $SET_COUNT -lt 1 ] ; then
-            # Create country ipset - append country drop rule using ipset
-            printf "create %s hash:net family inet hashsize 1024 maxelem 65536\n" ${cntopipset} >> ${IPSETCBLOAD}
-            printf "%s $topip-$CBLIST -m set --match-set ${cntopipset} src -j ${CBLISTDROP}\n" "-A" >> ${IPTCBTMP}
-            savesets=${cntopipset} ${savesets}
-        fi
-	printf "  Adding net %s to ipset %s\n" ${ipblock} ${cntopipset} >>${IPTCBLOG}
-        printf "add %s %s\n" ${cntopipset} ${ipblock} >> ${IPSETCBLOAD}
-    done
+    # Create iptables filter on country set
+    printf "Adding drop chain %s for country %s\n" ${CBLISTDROP} ${c}
+    printf "%s $CBLIST -m set --match-set ${_cset} src -j ${CBLISTDROP}\n" "-A" >> ${TMPIPTRULES}
 }
 
 generateIPTLoadFile() {
-    if [ "Z${IPSET}" = "Z" ] ; then
-        printf "Generating load file using verbose chains for rules" >>${IPTCBLOG}
+    if [ -z "${IPSET}" ] ; then
+        printf "Generating load file using verbose chains for rules"
     else
-        printf "Generating load file using ipset for rules" >>${IPTCBLOG}
+        printf "Generating load file using ipset for rules"
     fi
 
-    printf "# Generated by %s on %s %s %s %s %s %s %s\n*filter\n" $0 `date` > ${IPTCBLOAD}
+    printf "# Generated by %s on %s %s %s %s %s %s %s\n*filter\n" $0 `date` > ${TMPIPTBLS}
     # Create CBLIST chain
-    printf ":$CBLIST - [0:0]\n" >> ${IPTCBLOAD}
-    printf "%s INPUT ${IPTCBDEVICE:+-i }${IPTCBDEVICE} -j $CBLIST\n" "-I" > ${IPTCBTMP}
-    printf "%s OUTPUT ${IPTCBDEVICE:+-o }${IPTCBDEVICE} -j $CBLIST\n" "-I"  >> ${IPTCBTMP}
-    printf "%s FORWARD ${IPTCBDEVICE:+-i }${IPTCBDEVICE} -j $CBLIST\n" "-I" >> ${IPTCBTMP}
+    printf ":$CBLIST - [0:0]\n" >> ${TMPIPTBLS}
+    printf "%s INPUT ${XENODROPDEV:+-i }${XENODROPDEV} -j $CBLIST\n" "-I" > ${TMPIPTRULES}
+    printf "%s OUTPUT ${XENODROPDEV:+-o }${XENODROPDEV} -j $CBLIST\n" "-I"  >> ${TMPIPTRULES}
+    printf "%s FORWARD ${XENODROPDEV:+-i }${XENODROPDEV} -j $CBLIST\n" "-I" >> ${TMPIPTRULES}
 
-    printf "%s $CBLIST -m state --state RELATED,ESTABLISHED -j ACCEPT\n" "-I">> ${IPTCBTMP}
-    if [ "Z${ALLOWPORTS}" = "Z" ] ; then
-	printf "Blocking all traffic from country - no ports allowed\n" >>${IPTCBLOG}
+    printf "%s $CBLIST -m state --state RELATED,ESTABLISHED -j ACCEPT\n" "-I">> ${TMPIPTRULES}
+    if [ -z "${ALLOWPORTS}" ] ; then
+	printf "Blocking all traffic from country - no ports allowed\n"
     else
-	printf "%s $CBLIST -p tcp -m multiport --dports ${ALLOWPORTS} -j RETURN\n" "-I">> ${IPTCBTMP}
+	printf "%s $CBLIST -p tcp -m multiport --dports ${ALLOWPORTS} -j RETURN\n" "-I">> ${TMPIPTRULES}
     fi
 
-    if [ "Z${ALLOWSUBNET}" = "Z" ] ; then
-	printf "Blocking all traffic from country - no subnets excluded\n" >>${IPTCBLOG}
+    if [ -z "${ALLOWSUBNET}" ] ; then
+	printf "Blocking all traffic from country - no subnets excluded\n"
     else
-	printf "%s $CBLIST -s ${ALLOWSUBNET} -j RETURN\n" "-I">> ${IPTCBTMP}
+	printf "%s $CBLIST -s ${ALLOWSUBNET} -j RETURN\n" "-I">> ${TMPIPTRULES}
     fi
 
-    [ ! "Z${IPSET}" = "Z" ] && printf "# ipsets for country blocking rules\n" > ${IPSETCBLOAD}
+    [ ! -z "${IPSET}" ] && printf "# ipsets for country blocking rules\n" > ${TMPIPSETS}
 
     for c in $ISO ; do
-	printf "Blocking country %s in iptables country block rules\n" "$c" >>${IPTCBLOG}
-	if [ "Z${IPSET}" = "Z" ] ; then
+	printf "Blocking country %s in iptables country block rules\n" "$c"
+	if [ -z "${IPSET}" ] ; then
 	    addCountryIPRanges $c
 	else
 	    addCountryIPSet $c
 	fi
     done
-    mv -f ${IPSETCBLOAD} $IPSETCBRESTORE
-    cat ${IPTCBTMP} >> ${IPTCBLOAD}
-    printf "COMMIT\n# Completed on %s %s %s %s %s %s %s\n" `date` >> ${IPTCBLOAD}
+    mv -f ${TMPIPSETS} $XENODROPIPSETS
+    cat ${TMPIPTRULES} >> ${TMPIPTBLS} && rm -f ${TMPIPTRULES}
+    printf "COMMIT\n# Completed on %s %s %s %s %s %s %s\n" `date` >> ${TMPIPTBLS}
 
     TDT=`date "+%Y%m%d"`
-    [ ! -f ${IPTCBRESTORE}.${TDT}.bak ] && mv ${IPTCBRESTORE} ${IPTCBRESTORE}.${TDT}.bak
-    mv ${IPTCBLOAD} ${IPTCBRESTORE}
-    rm -f ${IPTCBTMP}
+    [ ! -f ${XENODROPIPTBLS}.${TDT}.bak ] && mv ${XENODROPIPTBLS} ${XENODROPIPTBLS}.${TDT}.bak
+    mv ${TMPIPTBLS} ${XENODROPIPTBLS}
 
     NUM=
-    [ "x$IPTABLES_STATUS_NUMERIC" = "xyes" ] && NUM="-n"
+    [[ "$XENODROP_STATUS_NUMERIC" == "yes" ]] && NUM="-n"
     VERBOSE= 
-    [ "x$IPTABLES_STATUS_VERBOSE" = "xyes" ] && VERBOSE="--verbose"
+    [[ "$XENODROP_STATUS_VERBOSE" == "yes" ]] && VERBOSE="--verbose"
     COUNT=
-    [ "x$IPTABLES_STATUS_LINENUMBERS" = "xyes" ] && COUNT="--line-numbers"
+    [[ "$XENODROP_STATUS_LINENUMBERS" == "yes" ]] && COUNT="--line-numbers"
 
     for table in "filter" ; do
 	echo $"Table: $table"
@@ -384,13 +416,90 @@ generateIPTLoadFile() {
 loadTables() {
     reuseIPTLoadFile
     generateIPTLoadFile
-    [ ! "Z${IPSET}" = "Z" ] && $IPSET restore -f ${IPSETCBRESTORE}
-    ${IPT}-restore -n ${IPTCBRESTORE}
+    [ ! "Z${IPSET}" = "Z" ] && $IPSET restore -f ${XENODROPIPSETS}
+    ${IPT}-restore -n ${XENODROPIPTBLS}
     printf "Country block instituted for: %s\n" "$ISO"
 }
 
+ipsetToFirewalldXML() {
+    _ipset_file=${1}
+    _xml_dir=${2}
+    _xml_file=
+    _setname=
+    _settype=
+    _hashsz=
+    _maxel=
+    _setentry=
+
+    [ ! -d $_xml_dir ] && mkdir -p $_xml_dir
+    printf "Translating ipset definitions %s to firewalld ipset xml in %s\n" "${_ipset_file}" "$_xml_dir"
+    while IFS= read -r _ln ; do
+	_lntype=`echo $_ln | cut -f 1 -d ' '`
+	_wtype=
+	for _w in $_ln ; do
+	    [[ "$_wtype" == "create" ]] && _setname=$_w
+	    [[ "$_wtype" == "hashsize" ]] && _hashsz=$_w
+	    [[ "$_wtype" == "maxelem" ]] && _maxel=$_w
+	    if [[ "$_wtype" =~ geo_.* ]] ; then
+		[[ "$_lntype" == "create" ]] && _settype=$_w
+		[[ "$_lntype" == "add" ]] && _setentry=$_w
+	    fi
+	    _wtype=$_w
+	done
+	if [[ "$_lntype" == "create" ]] ; then
+	    [ ! -z "$_xml_file" ] && printf "</ipset>\n" >> ${_xml_file}
+	    _xml_file=${_xml_dir}/${_setname}.xml
+	    printf "<?xml version='1.0' encoding='utf-8'?>\n<ipset type='%s'>\n  <option name='hashsize' value='%s'/>\n  <option name='maxelem' value='%s'/>\n  <short>%s</short>\n  <description>%s</description>\n" "${_settype}" "${_hashsz}" "${_maxel}" "${_setname}" "Xenodrop list of country IP ranges" > ${_xml_file}
+	    printf "...creating firewalld ipset xml config %s\n" "${_xml_file}"
+	fi
+	[ "$_lntype" == "add" ] && printf "  <entry>%s</entry>\n" "${_setentry}" >> ${_xml_file}
+    done < "${_ipset_file}"
+    [ ! -z "$_xml_file" ] && printf "</ipset>\n" >> ${_xml_file}
+}
+
+firewalldDropZone() {
+    # Import ipsets for countries to firewalld
+    for c in $ISO ; do
+	printf "Add country %s IP ranges to linux ipset definition\n" "$c"
+	_cset=`genCountryIPSet ${c} ${TMPIPSETS}`
+    done
+    if [ ${TMPIPSETS} -nt ${XENODROPIPSETS} ] ; then
+	mv ${TMPIPSETS} ${XENODROPIPSETS}
+    else
+	printf "Zone cache predates last Linux ipsets generation\n"
+    fi
+    ipsetToFirewalldXML ${XENODROPIPSETS} /etc/firewalld/ipsets
+    /usr/bin/restorecon -R /etc/firewalld
+    firewall-cmd --reload
+
+    # Apply defined subnet exceptions to drop zone
+
+    # Apply defined port exceptions to drop zone
+
+    # Identify currently bound geo sets in drop zone
+    _zsrcs=`firewall-cmd --zone=drop --list-sources | sed -e 's/ipset:geo_//'`
+
+    # Apply country ipsets to drop zone
+    for c in $ISO ; do
+	# Skip addition if ipset XML is missing or ipset is already bound
+	[[ ! -f /etc/firewalld/ipsets/geo_${c}.xml ]] || [[ "$_zsrcs" =~ ${c} ]] && continue
+	firewall-cmd -q --zone=drop --add-source=ipset:geo_${c}
+	[ $? -eq 0 ] && printf "Activate ipset drop of geo_%s via firewalld\n" "$c"
+	firewall-cmd -q --permanent --zone=drop --add-source=ipset:geo_${c}
+    done
+
+    # Remove unconfigured geo ipsets from "drop" zone
+    for _cn in $_zsrcs ; do
+	if [[ ! "$ISO" =~ ${_cn} ]] ; then
+	    firewall-cmd -q --zone=drop --remove-source=ipset:geo_${_cn}
+	    [ $? -eq 0 ] && printf "Removed ipset geo_%s from firewalld drop zone\n" "${_cn}"
+	    firewall-cmd -q --permanent --zone=drop --remove-source=ipset:geo_${_cn}
+	fi
+    done
+}
+
 stop() {
-    echo -n $"${IPTABLESCB}: Removing cb firewall rules: "
+    echo -n $"${PROGNAME}: Removing xenodrop firewall rules: "
 
     # clean old rules
     cleanOldRules
@@ -403,16 +512,22 @@ stop() {
 }
 
 start() {
-    echo -n $"${IPTABLESCB}: Applying cb firewall rules: "
-
-   # create a dir
-    [ ! -d $ZONEROOT ] && /bin/mkdir -p $ZONEROOT
+    echo -n $"${PROGNAME}: Applying xenodrop firewall rules: "
+    
+    # create a dir
+    [ ! -d $XENOROOT ] && /bin/mkdir -p $XENOROOT
  
     # update zone files as needed
     updateZoneFiles
 
-    # create a new iptables list
-    loadTables
+    if [ -d /etc/firewalld/ipsets ] ; then
+	# add country set to firewalld drop zone
+	firewalldDropZone
+    else
+	# Add a new iptables list
+	loadTables
+    fi
+
 
     if [ $? -eq 0 ]; then
 	success; echo
@@ -438,7 +553,16 @@ status() {
     done
 }
 
-#[ ! "x$IPTABLES_VERBOSE" = "xyes" ] && exec 1>/dev/null
+if [[ ! -z $XENODROP_LOGUNIT ]] ; then
+    #[ ! "x$XENODROP_VERBOSE" = "xyes" ] && exec 1>/dev/null
+    # Redirect stdout / stderr to syslog / journald
+    exec 1> >(logger -p info --id=$$ -t ${XENODROP_LOGUNIT}) && exec 2> >(logger -p err --id=$$ -t ${XENODROP_LOGUNIT})
+    # Create file descriptor 5 for debug output...
+    exec 5> >(logger -p debug --id=$$ -t ${XENODROP_LOGUNIT})
+else
+    exec 5> /dev/null
+fi
+
 case "$1" in
     start)
 	[ -f "$VAR_SUBSYS_IPTABLES" ] && exit 0
@@ -446,7 +570,7 @@ case "$1" in
 	RETVAL=$?
 	;;
     stop)
-	[ "x$IPTABLES_SAVE_ON_STOP" = "xyes" ] && save
+	[ "x$XENODROP_SAVE_ON_STOP" = "xyes" ] && save
 	stop
 	RETVAL=$?
 	;;
@@ -454,6 +578,7 @@ case "$1" in
         export MAXZONEAGE=0
         updateZoneFiles
  	RETVAL=$?
+	[ $RETVAL -gt 0 ] && generateIPTLoadFile && RETVAL=$?
 	;;
     restart|force-reload)
 	restart
@@ -468,7 +593,7 @@ case "$1" in
 	RETVAL=$?
 	;;
     *)
-	echo $"Usage: ${IPTABLESCB} {start|stop|force-regenerate|restart|force-reload|status}"
+	echo $"Usage: ${PROGNAME} {start|stop|force-regenerate|restart|force-reload|status}"
 	echo "$1 not a supported option"
 	RETVAL=2
 	;;
