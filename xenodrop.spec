@@ -14,17 +14,18 @@ Group: System Environment/Base
 Source0: xenodrop.tgz
 URL: http://psind.com/solutions/products/technology-infrastructure/xenodrop/
 BuildArch: noarch
-BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
-BuildRequires: iptables
+BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-XXXXXX)
 Conflicts: kernel < 2.4.20
-Requires: iptables
-Requires(preun): %{_sbindir}/alternatives chkconfig
-Requires(post): %{_sbindir}/alternatives chkconfig
+Requires: iptables systemd
+Requires(preun): %{_sbindir}/alternatives systemd
+Requires(post): %{_sbindir}/alternatives systemd
 Requires(postun): %{_sbindir}/alternatives
 Distribution: Fedora Core Linux
 Vendor: PSInd, LLC
 Packager: David Picard <dpicard@psind.com>
 
+BuildRequires: systemd-rpm-macros
+%{?systemd_requires}
 
 %description
 This service downloads CIDR lists for each country and builds the necessary
@@ -43,68 +44,68 @@ to pass through the firewall
 Summary: Systemd support for xenodrop
 Group: System Environment/Base
 Requires: %{name} = %{version}-%{release}
-Requires(post): chkconfig
-Requires(preun): chkconfig
 
 %description systemd
 The xenodrop package contains support to start and stop country blocking
 through the systemd service management mechanisms
 
 %prep
-%setup
+%setup -q
 
 %build
 
-
 %install
 install -d -m 755 %{buildroot}%{_sysconfdir}/sysconfig
-install -m 644 iptables.xenodrop %{buildroot}%{_sysconfdir}/sysconfig
-install -m 644 xenodrop-config %{buildroot}%{_sysconfdir}/sysconfig
+install -m 644 %{name}-config %{buildroot}%{_sysconfdir}/sysconfig
 install -d -m 755 %{buildroot}%{_sysconfdir}/rc.d/init.d
+install -d -m 755 %{buildroot}/var/%{name}
+install -d -m 755 %{buildroot}/var/cache/%{name}
 install -c -m 755 ipset.sh %{buildroot}%{_sysconfdir}/rc.d/init.d/ipset
-install -c -m 755 xenodrop.sh %{buildroot}%{_sysconfdir}/rc.d/init.d/xenodrop
+install -c -m 755 xenodrop.sh %{buildroot}%{_sysconfdir}/rc.d/init.d/%{name}
 # % install systemd
-install -d -m 755 %{buildroot}%{_libexecdir}/xenodrop
-install -d -m 755 %{buildroot}${_libdir}/systemd/system
-install -m 755 ipset.sh %{buildroot}%{_libexecdir}/xenodrop
-install -m 755 xenodrop.sh %{buildroot}%{_libexecdir}/xenodrop
-install -m 644 ipset.service %{buildroot}${_libdir}/systemd/system
-install -m 644 xenodrop.service %{buildroot}${_libdir}/systemd/system
+install -d -m 755 %{buildroot}%{_libexecdir}/%{name}
+install -d -m 755 %{buildroot}%{_libdir}/systemd/system
+install -d -m 755 %{buildroot}/var/%{name}
+install -d -m 755 %{buildroot}/var/cache/%{name}
+install -m 755 ipset.sh %{buildroot}%{_libexecdir}/%{name}
+install -m 755 xenodrop.sh %{buildroot}%{_libexecdir}/%{name}
+install -m 644 ipset.service %{buildroot}%{_libdir}/systemd/system
+install -m 644 %{name}.service %{buildroot}%{_libdir}/systemd/system
 
 %clean
 rm -rf %{buildroot}
 
 %files
 %defattr(-,root,root,-)
-%doc README
-%config(noreplace) %attr(0600,root,root) /etc/sysconfig/xenodrop-config
-%attr(0644,root,root) %{_sysconfdir}/sysconfig/iptables.xenodrop
+%doc README.md
+%config(noreplace) %attr(0600,root,root) %{_sysconfdir}/sysconfig/%{name}-config
 %attr(0755,root,root) %{_sysconfdir}/rc.d/init.d/ipset
-%attr(0755,root,root) %{_sysconfdir}/rc.d/init.d/xenodrop
+%attr(0755,root,root) %{_sysconfdir}/rc.d/init.d/%{name}
 
 %files systemd
-%doc README
-%config(noreplace) %attr(0600,root,root) %{_sysconfdir}/sysconfig/xenodrop-config
-%attr(0644,root,root) %{_sysconfdir}/sysconfig/iptables.xenodrop
-%attr(0755,root,root) ${_libdir}/systemd/system/ipset.service
-%attr(0755,root,root) ${_libdir}/systemd/system/xenodrop.service
-%attr(0644,root,root) %{_libexecdir}/iptables/ipset.init
-%attr(0644,root,root) %{_libexecdir}/iptables/xenodrop.init
+%defattr(-,root,root,-)
+%doc README.md
+%config(noreplace) %attr(0600,root,root) %{_sysconfdir}/sysconfig/%{name}-config
+%attr(0755,root,root) %{_libdir}/systemd/system/ipset.service
+%attr(0755,root,root) %{_libdir}/systemd/system/%{name}.service
+%attr(0644,root,root) %{_libexecdir}/xenodrop/ipset.sh
+%attr(0644,root,root) %{_libexecdir}/xenodrop/xenodrop.sh
 
 %post
-/sbin/chkconfig --add xenodrop
+%systemd_post %{name}.service
 
 %preun
-if [ "$1" = 0 ]; then
-        /sbin/chkconfig --del xenodrop
-fi
+%systemd_preun %{name}.service
+
+%postun
+%systemd_postun_with_restart %{name}.service
 
 %changelog
 * Mon Jul 27 2026 David Picard <dpicard@psind.com> 1.0.4-1
 - Rebrand to xenodrop
 - Introduce configuration of firewalld for Fedora Core Linux
 - Modifications to use of country zone file cache usage and maintenance
-* Mon Apr 07 2015 David Picard <dpicard@psind.com> 1.0.3-1
+* Tue Apr 07 2015 David Picard <dpicard@psind.com> 1.0.3-1
 - Fix to initialization of cache regeneration variable
 - Fix to addCountryIPSet function on saveset initialization
 - Modifications to flush in old rule cleanup
