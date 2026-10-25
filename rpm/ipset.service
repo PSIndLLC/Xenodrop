@@ -1,0 +1,17 @@
+[Unit]
+Description=IPSet definitions
+After=syslog.target
+ConditionPathExists=/etc/sysconfig/ipset
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/xenodrop/ipset.sh start
+ExecStop=/usr/libexec/xenodrop/ipset.sh stop
+Environment=BOOTUP=serial
+Environment=CONSOLETYPE=serial
+StandardOutput=syslog
+StandardError=syslog
+
+[Install]
+WantedBy=basic.target
